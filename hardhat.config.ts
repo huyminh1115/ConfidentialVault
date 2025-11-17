@@ -9,8 +9,8 @@ import type { HardhatUserConfig } from "hardhat/config";
 import { vars } from "hardhat/config";
 import "solidity-coverage";
 
-import "./tasks/accounts";
-import "./tasks/FHECounter";
+// import "./tasks/accounts";
+// import "./tasks/FHECounter";
 
 // Run 'npx hardhat vars setup' to see the list of variables that need to be set
 
@@ -65,7 +65,7 @@ const config: HardhatUserConfig = {
     tests: "./test",
   },
   solidity: {
-    version: "0.8.24",
+    version: "0.8.26",
     settings: {
       metadata: {
         // Not including the metadata hash
@@ -79,6 +79,7 @@ const config: HardhatUserConfig = {
         runs: 800,
       },
       evmVersion: "cancun",
+      viaIR: true,
     },
   },
   typechain: {
