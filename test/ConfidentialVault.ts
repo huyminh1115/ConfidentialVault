@@ -5,10 +5,10 @@ import { expect } from "chai";
 import { ethers, fhevm } from "hardhat";
 
 import {
-  CERC4626V2,
-  MintableConfidentialFungibleToken,
-  CERC4626V2__factory,
-  MintableConfidentialFungibleToken__factory,
+  ConfidentialVault,
+  ERC7984MintableBurnable,
+  ConfidentialVault__factory,
+  ERC7984MintableBurnable__factory,
 } from "../types";
 
 // Constants for better maintainability
@@ -51,17 +51,24 @@ class TestHelpers {
    * Mints confidential tokens to a user using the simple mint function
    */
   static async mintToUser(
-    underlying: MintableConfidentialFungibleToken,
+    underlying: ERC7984MintableBurnable,
     mintToAddress: string,
     amount: bigint,
     deployer: HardhatEthersSigner,
     user?: HardhatEthersSigner, //  to get decrypted balance
   ) {
-    // Use the simple mint function that takes euint64 directly
-    const encrypted = await this.createEncryptedMint(await underlying.getAddress(), deployer, amount);
-    await underlying["mint(address,bytes32,bytes)"](mintToAddress, encrypted.handles[0], encrypted.inputProof);
+    // Get contract address
+    const contractAddress = await underlying.getAddress();
 
-    const balance = await underlying.balanceOf(mintToAddress);
+    // Create encrypted input for the deployer (who will call the mint function)
+    // Following the pattern from FHECounter: encrypted input is created for the caller's address
+    const encrypted = await this.createEncryptedMint(contractAddress, deployer, amount);
+
+    // Mint tokens to the specified address (deployer calls as owner)
+    // The proof is created by deployer, but tokens are minted to mintToAddress
+    await underlying.connect(deployer).mint(mintToAddress, encrypted.handles[0], encrypted.inputProof);
+
+    const balance = await underlying.confidentialBalanceOf(mintToAddress);
 
     let clearBalance = undefined;
 
@@ -79,11 +86,7 @@ class TestHelpers {
   /**
    * Sets operator for confidential transfers
    */
-  static async setOperator(
-    underlying: MintableConfidentialFungibleToken,
-    user: HardhatEthersSigner,
-    operatorAddress: string,
-  ) {
+  static async setOperator(underlying: ERC7984MintableBurnable, user: HardhatEthersSigner, operatorAddress: string) {
     const expiry = BigInt((await time.latest()) + OPERATOR_EXPIRY_OFFSET);
     await underlying.connect(user).setOperator(operatorAddress, expiry);
   }
@@ -91,11 +94,16 @@ class TestHelpers {
   /**
    * Performs a deposit and returns shares
    */
-  static async performDeposit(vault: CERC4626V2, user: HardhatEthersSigner, amount: bigint, vaultAddress: string) {
+  static async performDeposit(
+    vault: ConfidentialVault,
+    user: HardhatEthersSigner,
+    amount: bigint,
+    vaultAddress: string,
+  ) {
     const encrypted = await this.createEncryptedDeposit(vaultAddress, user, amount);
-    await vault.connect(user).deposit(user.address, encrypted.handles[0], encrypted.inputProof);
+    await vault.connect(user).confidentialDeposit(user.address, encrypted.handles[0], encrypted.inputProof);
 
-    const shares = await vault.balanceOf(user.address);
+    const shares = await vault.confidentialBalanceOf(user.address);
     const clearShares = await fhevm.userDecryptEuint(FhevmType.euint64, shares.toString(), vaultAddress, user);
     return { shares, clearShares };
   }
@@ -103,12 +111,17 @@ class TestHelpers {
   /**
    * Performs a withdrawal and returns withdrawn shares
    */
-  static async performWithdraw(vault: CERC4626V2, user: HardhatEthersSigner, amount: bigint, vaultAddress: string) {
+  static async performWithdraw(
+    vault: ConfidentialVault,
+    user: HardhatEthersSigner,
+    amount: bigint,
+    vaultAddress: string,
+  ) {
     const encrypted = await this.createEncryptedDeposit(vaultAddress, user, amount);
 
-    await vault.connect(user).withdraw(user.address, encrypted.handles[0], encrypted.inputProof);
+    await vault.connect(user).confidentialWithdraw(user.address, encrypted.handles[0], encrypted.inputProof);
 
-    const shareLeft = await vault.balanceOf(user.address);
+    const shareLeft = await vault.confidentialBalanceOf(user.address);
     const shareLeftClear = await fhevm.userDecryptEuint(FhevmType.euint64, shareLeft, vaultAddress, user);
 
     return { shareLeftClear };
@@ -117,12 +130,17 @@ class TestHelpers {
   /**
    * Redeems shares for assets and returns remaining shares
    */
-  static async performRedeem(vault: CERC4626V2, user: HardhatEthersSigner, shares: bigint, vaultAddress: string) {
+  static async performRedeem(
+    vault: ConfidentialVault,
+    user: HardhatEthersSigner,
+    shares: bigint,
+    vaultAddress: string,
+  ) {
     const encryptedShares = await this.createEncryptedDeposit(vaultAddress, user, shares);
 
     await vault.connect(user).redeem(user.address, encryptedShares.handles[0], encryptedShares.inputProof);
 
-    const shareLeft = await vault.balanceOf(user.address);
+    const shareLeft = await vault.confidentialBalanceOf(user.address);
     const shareLeftClear = await fhevm.userDecryptEuint(FhevmType.euint64, shareLeft, vaultAddress, user);
 
     return { shareLeftClear };
@@ -132,11 +150,11 @@ class TestHelpers {
    * Gets decrypted balance for a user
    */
   static async getDecryptedBalance(
-    contract: MintableConfidentialFungibleToken | CERC4626V2,
+    contract: ERC7984MintableBurnable | ConfidentialVault,
     user: HardhatEthersSigner,
     userAddress: string,
   ) {
-    const balance = await contract.balanceOf(userAddress);
+    const balance = await contract.confidentialBalanceOf(userAddress);
     const clearBalance = await fhevm.userDecryptEuint(
       FhevmType.euint64,
       balance.toString(),
@@ -150,8 +168,8 @@ class TestHelpers {
    * Converts decrypted asset balance to shares using on-chain ratio
    */
   static async convertToShares(
-    vault: CERC4626V2,
-    underlying: MintableConfidentialFungibleToken,
+    vault: ConfidentialVault,
+    underlying: ERC7984MintableBurnable,
     user: HardhatEthersSigner,
   ) {
     const { clearBalance: assetBalance } = await this.getDecryptedBalance(underlying, user, user.address);
@@ -163,7 +181,7 @@ class TestHelpers {
   /**
    * Converts decrypted share balance to assets using on-chain ratio
    */
-  static async convertToAssets(vault: CERC4626V2, user: HardhatEthersSigner) {
+  static async convertToAssets(vault: ConfidentialVault, user: HardhatEthersSigner) {
     const { clearBalance: shareBalance } = await this.getDecryptedBalance(vault, user, user.address);
     const ratio = await vault.ratio();
     const computedAssets = (shareBalance * BASE_RATE) / ratio;
@@ -171,11 +189,11 @@ class TestHelpers {
   }
 }
 
-describe("cERC4626V2 deposit/ratio/withdraw flow", function () {
+describe("ConfidentialVault deposit/ratio/withdraw flow", function () {
   // Cached variables for better performance
   let signers: Signers;
-  let underlying: MintableConfidentialFungibleToken;
-  let vault: CERC4626V2;
+  let underlying: ERC7984MintableBurnable;
+  let vault: ConfidentialVault;
   let underlyingAddress: string;
   let vaultAddress: string;
   let initialRatio: bigint;
@@ -190,19 +208,27 @@ describe("cERC4626V2 deposit/ratio/withdraw flow", function () {
     }
 
     // Deploy underlying confidential token
-    underlying = (await (
-      await new MintableConfidentialFungibleToken__factory(signers.deployer).deploy(
-        "Underlying",
-        "uTKN",
-        "",
-        signers.deployer.address,
-      )
-    ).waitForDeployment()) as MintableConfidentialFungibleToken;
+    // Constructor expects: (address owner, string name, string symbol, string uri)
+    const underlyingDeployment = await new ERC7984MintableBurnable__factory(signers.deployer).deploy(
+      signers.deployer.address, // owner (first parameter)
+      "Underlying", // name (second parameter)
+      "uTKN", // symbol (third parameter)
+      "", // uri (fourth parameter)
+    );
+    underlying = (await underlyingDeployment.waitForDeployment()) as ERC7984MintableBurnable;
 
-    // Deploy cERC4626V2 vault (it is also the share token)
+    // Ensure deployment is fully complete before proceeding
+    await underlying.getAddress();
+
+    // Deploy ConfidentialVault vault (it is also the share token)
     vault = (await (
-      await new CERC4626V2__factory(signers.deployer).deploy("Vault Share", "vSHARE", "", await underlying.getAddress())
-    ).waitForDeployment()) as CERC4626V2;
+      await new ConfidentialVault__factory(signers.deployer).deploy(
+        "Vault Share",
+        "vSHARE",
+        "",
+        await underlying.getAddress(),
+      )
+    ).waitForDeployment()) as ConfidentialVault;
 
     // Cache addresses for better performance
     underlyingAddress = await underlying.getAddress();
@@ -345,7 +371,9 @@ describe("cERC4626V2 deposit/ratio/withdraw flow", function () {
       );
 
       await expect(
-        vault.connect(signers.alice).deposit(signers.alice.address, encrypted.handles[0], encrypted.inputProof),
+        vault
+          .connect(signers.alice)
+          .confidentialDeposit(signers.alice.address, encrypted.handles[0], encrypted.inputProof),
       ).to.be.revertedWithCustomError(vault, "NotOpen");
 
       // Reopen vault for other tests
@@ -427,7 +455,9 @@ describe("cERC4626V2 deposit/ratio/withdraw flow", function () {
       );
 
       await expect(
-        vault.connect(signers.alice).withdraw(signers.alice.address, encrypted.handles[0], encrypted.inputProof),
+        vault
+          .connect(signers.alice)
+          .confidentialWithdraw(signers.alice.address, encrypted.handles[0], encrypted.inputProof),
       ).to.be.revertedWithCustomError(vault, "NotOpen");
 
       // Reopen vault for other tests
@@ -521,8 +551,8 @@ describe("cERC4626V2 deposit/ratio/withdraw flow", function () {
       await vault.connect(signers.deployer).updateSnapshot();
 
       const vaultAddr = await vault.getAddress();
-      const snapshotAssets = await vault.snapshotTotalAssets();
-      const snapshotShares = await vault.snapshotTotalShares();
+      const snapshotAssets = await vault.totalAssets();
+      const snapshotShares = await vault.totalShares();
 
       const decryptedAssets = await fhevm.userDecryptEuint(
         FhevmType.euint64,
@@ -568,11 +598,40 @@ describe("cERC4626V2 deposit/ratio/withdraw flow", function () {
 
       const receipt = await tx.wait();
       void expect(receipt).to.not.be.null;
-
-      await fhevm.awaitDecryptionOracle();
     });
 
     it("Test Alice redeem shares for assets", async function () {
+      // get request id from contract
+      const requestId = await vault.requestCounter();
+
+      console.log("requestId: ", requestId);
+
+      // get request decrypt bool from contract
+      const requestDecryptBool = (await vault.requests(requestId)).isCorrect;
+
+      // Call the Zama Relayer to compute the decryption
+      const publicDecryptResults = await fhevm.publicDecrypt([requestDecryptBool]);
+
+      // The Relayer returns a `PublicDecryptResults` object containing:
+      // - the ORDERED clear values (here we have only one single value)
+      // - the ORDERED clear values in ABI-encoded form
+      // - the KMS decryption proof associated with the ORDERED clear values in ABI-encoded form
+      const abiEncodedClearRequestDecryptBool = publicDecryptResults.abiEncodedClearValues;
+      const decryptionProof = publicDecryptResults.decryptionProof;
+
+      // The clear value is also ABI-encoded
+      const decodedRequestDecryptBool = ethers.AbiCoder.defaultAbiCoder().decode(
+        ["bool"],
+        abiEncodedClearRequestDecryptBool,
+      )[0];
+
+      console.log("decodedRequestDecryptBool: ", decodedRequestDecryptBool);
+
+      // call to contract to finalize the ratio update
+      await vault
+        .connect(signers.deployer)
+        .finalizeUpdateRatio(requestId, abiEncodedClearRequestDecryptBool, decryptionProof);
+
       const { clearBalance: beforeBalance } = await TestHelpers.getDecryptedBalance(
         underlying,
         signers.alice,
@@ -595,7 +654,6 @@ describe("cERC4626V2 deposit/ratio/withdraw flow", function () {
       );
 
       // Check underlying increased by withdrawn assets
-
       expect(afterBalance - beforeBalance).to.eq(
         TEST_AMOUNTS.aliceDeposit +
           (TEST_AMOUNTS.yieldToVault * TEST_AMOUNTS.aliceDeposit) /

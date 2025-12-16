@@ -38,6 +38,7 @@ For detailed instructions see:
    ```bash
    npm run compile
    npm run test
+   npm run test:gas   # emits per-function gas + tx size stats
    ```
 
 4. **Deploy to local network**
@@ -80,13 +81,14 @@ fhevm-hardhat-template/
 
 ## 📜 Available Scripts
 
-| Script             | Description              |
-| ------------------ | ------------------------ |
-| `npm run compile`  | Compile all contracts    |
-| `npm run test`     | Run all tests            |
-| `npm run coverage` | Generate coverage report |
-| `npm run lint`     | Run linting checks       |
-| `npm run clean`    | Clean build artifacts    |
+| Script             | Description                  |
+| ------------------ | ---------------------------- |
+| `npm run compile`  | Compile all contracts        |
+| `npm run test`     | Run all tests                |
+| `npm run test:gas` | Run tests with gas + tx logs |
+| `npm run coverage` | Generate coverage report     |
+| `npm run lint`     | Run linting checks           |
+| `npm run clean`    | Clean build artifacts        |
 
 ## 📚 Documentation
 

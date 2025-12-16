@@ -17,6 +17,8 @@ import "solidity-coverage";
 const MNEMONIC: string = vars.get("MNEMONIC", "test test test test test test test test test test test junk");
 const INFURA_API_KEY: string = vars.get("INFURA_API_KEY", "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz");
 
+const shouldReportGas = !!process.env.REPORT_GAS;
+
 const config: HardhatUserConfig = {
   defaultNetwork: "hardhat",
   namedAccounts: {
@@ -29,8 +31,12 @@ const config: HardhatUserConfig = {
   },
   gasReporter: {
     currency: "USD",
-    enabled: process.env.REPORT_GAS ? true : false,
+    enabled: shouldReportGas,
+    coinmarketcap: process.env.COINMARKETCAP_API_KEY,
     excludeContracts: [],
+    showMethodSig: true,
+    outputFile: shouldReportGas ? "gas-report.txt" : undefined,
+    noColors: shouldReportGas,
   },
   networks: {
     hardhat: {
@@ -65,7 +71,7 @@ const config: HardhatUserConfig = {
     tests: "./test",
   },
   solidity: {
-    version: "0.8.26",
+    version: "0.8.27",
     settings: {
       metadata: {
         // Not including the metadata hash
@@ -79,12 +85,15 @@ const config: HardhatUserConfig = {
         runs: 800,
       },
       evmVersion: "cancun",
-      viaIR: true,
+      viaIR: false,
     },
   },
   typechain: {
     outDir: "types",
     target: "ethers-v6",
+  },
+  mocha: {
+    require: ["ts-node/register", "./test/setup/txMetrics"],
   },
 };
 

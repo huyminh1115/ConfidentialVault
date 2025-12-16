@@ -1,19 +1,21 @@
 // SPDX-License-Identifier: MIT
+pragma solidity ^0.8.27;
 
-pragma solidity ^0.8.26;
-
-import {SepoliaConfig} from "@fhevm/solidity/config/ZamaConfig.sol";
 import {FHE, externalEuint64, euint64, ebool} from "@fhevm/solidity/lib/FHE.sol";
-import {
-    ConfidentialFungibleToken,
-    IConfidentialFungibleToken
-} from "@openzeppelin/contracts-confidential/token/ConfidentialFungibleToken.sol";
-import {ERC4626} from "@openzeppelin/contracts/token/ERC20/extensions/ERC4626.sol";
-import {MintableConfidentialFungibleToken} from "./MintableConfidentialFungibleToken.sol";
-import "hardhat/console.sol";
+import {ERC7984} from "@openzeppelin/confidential-contracts/token/ERC7984/ERC7984.sol";
+import {ERC7984MintableBurnable} from "./ERC7984MintableBurnable.sol";
 
-contract cERC4626V2 is MintableConfidentialFungibleToken {
-    uint8 private _underlyingDecimals;
+/**
+ * @title ConfidentialVault
+ * @notice Confidential ERC4626 compatible vault with snapshot-based ratio updates.
+ * @dev Built on top of MintableConfidentialFungibleToken and FHE primitives.
+ */
+contract ConfidentialVault is ERC7984MintableBurnable {
+    struct Request {
+        uint64 newRatio;
+        ebool isCorrect;
+    }
+
     uint8 private constant PRECISION_DECIMALS = 6;
     uint64 private constant BASE_RATE = uint64(10 ** PRECISION_DECIMALS);
 
@@ -25,25 +27,30 @@ contract cERC4626V2 is MintableConfidentialFungibleToken {
     euint64 public snapshotTotalAssets;
     euint64 public snapshotTotalShares;
 
-    mapping(uint256 requestId => uint64 ratio) public requestRatio;
+    uint256 public requestCounter;
+
+    mapping(uint256 requestId => Request request) public requests;
+
+    uint8 private _underlyingDecimals;
 
     error NotOpen();
+    error InvalidVaultManager();
+
+    event EventRequestUpdateRatio(uint256 requestId, uint64 ratio);
 
     constructor(
         string memory name_,
         string memory symbol_,
         string memory uri_,
         address cAsset_
-    ) MintableConfidentialFungibleToken(name_, symbol_, uri_, msg.sender) {
-        (bool success, uint8 assetDecimals) = _tryGetAssetDecimals(IConfidentialFungibleToken(cAsset_));
-        _underlyingDecimals = success ? assetDecimals : 6;
+    ) ERC7984MintableBurnable(msg.sender, name_, symbol_, uri_) {
+        uint8 assetDecimals = ERC7984(cAsset_).decimals();
+        _underlyingDecimals = assetDecimals;
         cAsset = cAsset_;
 
         // init ratio as 10 ** BASE_RATE
         ratio = BASE_RATE;
-
         isOpen = true;
-
         vaultManager = msg.sender;
     }
 
@@ -54,29 +61,25 @@ contract cERC4626V2 is MintableConfidentialFungibleToken {
         _;
     }
 
+    modifier onlyVaultManager() {
+        if (msg.sender != vaultManager) {
+            revert InvalidVaultManager();
+        }
+        _;
+    }
+
     function setIsOpen(bool _isOpen) external onlyOwner {
         isOpen = _isOpen;
     }
 
-    /**
-     * @dev Attempts to fetch the asset decimals. A return value of false indicates that the attempt failed in some way.
-     */
-    function _tryGetAssetDecimals(
-        IConfidentialFungibleToken cAsset_
-    ) private view returns (bool ok, uint8 assetDecimals) {
-        (bool success, bytes memory encodedDecimals) = address(cAsset_).staticcall(
-            abi.encodeCall(IConfidentialFungibleToken.decimals, ())
-        );
-        if (success && encodedDecimals.length >= 32) {
-            uint64 returnedDecimals = abi.decode(encodedDecimals, (uint64));
-            if (returnedDecimals <= type(uint8).max) {
-                return (true, uint8(returnedDecimals));
-            }
+    function setVaultManager(address newManager) external onlyOwner {
+        if (newManager == address(0)) {
+            revert InvalidVaultManager();
         }
-        return (false, 0);
+        vaultManager = newManager;
     }
 
-    function decimals() public view virtual override(ConfidentialFungibleToken) returns (uint8) {
+    function decimals() public view virtual override(ERC7984) returns (uint8) {
         return _underlyingDecimals;
     }
 
@@ -85,14 +88,14 @@ contract cERC4626V2 is MintableConfidentialFungibleToken {
     }
 
     function totalAssets() public view virtual returns (euint64) {
-        return IConfidentialFungibleToken(cAsset).balanceOf(address(this));
+        return ERC7984(cAsset).confidentialBalanceOf(address(this));
     }
 
     function totalShares() public view virtual returns (euint64) {
-        return totalSupply();
+        return super.confidentialTotalSupply();
     }
 
-    function maxDeposit(address receiver) public view virtual returns (uint64) {
+    function maxDeposit(address /*receiver*/) public view virtual returns (uint64) {
         return type(uint64).max;
     }
 
@@ -102,7 +105,7 @@ contract cERC4626V2 is MintableConfidentialFungibleToken {
         return FHE.select(isOverMaxContribute, ableToContribute, depositAmount);
     }
 
-    function deposit(
+    function confidentialDeposit(
         address receiver,
         externalEuint64 encryptedAssetsAmount,
         bytes calldata inputProof
@@ -111,7 +114,7 @@ contract cERC4626V2 is MintableConfidentialFungibleToken {
         euint64 finalDepositAmount = _handleDeposit(depositAmount);
 
         euint64 shares = FHE.div(FHE.mul(finalDepositAmount, ratio), BASE_RATE);
-        _deposit(msg.sender, receiver, finalDepositAmount, shares);
+        _deposit(receiver, finalDepositAmount, shares);
 
         return shares;
     }
@@ -128,20 +131,16 @@ contract cERC4626V2 is MintableConfidentialFungibleToken {
         euint64 finalDepositAmount = _handleDeposit(depositAmount);
 
         euint64 finalShares = FHE.div(FHE.mul(finalDepositAmount, ratio), BASE_RATE);
-        _deposit(msg.sender, receiver, finalDepositAmount, finalShares);
+        _deposit(receiver, finalDepositAmount, finalShares);
 
         return finalShares;
     }
 
-    function _deposit(address caller, address receiver, euint64 finalDepositAmount, euint64 shares) internal virtual {
+    function _deposit(address receiver, euint64 finalDepositAmount, euint64 shares) internal virtual {
         FHE.allowTransient(finalDepositAmount, address(cAsset));
 
         // Perform confidential transfer
-        euint64 transferred = IConfidentialFungibleToken(cAsset).confidentialTransferFrom(
-            msg.sender,
-            address(this),
-            finalDepositAmount
-        );
+        euint64 transferred = ERC7984(cAsset).confidentialTransferFrom(msg.sender, address(this), finalDepositAmount);
 
         ebool isTransferred = FHE.eq(transferred, finalDepositAmount);
 
@@ -150,7 +149,7 @@ contract cERC4626V2 is MintableConfidentialFungibleToken {
         _mint(receiver, mintAmount);
     }
 
-    function withdraw(
+    function confidentialWithdraw(
         address _receiver,
         externalEuint64 _encryptedAssetsAmount,
         bytes calldata _inputProof
@@ -185,11 +184,7 @@ contract cERC4626V2 is MintableConfidentialFungibleToken {
         FHE.allowTransient(_finalWithdrawAmount, address(cAsset));
 
         // Perform confidential transfer
-        euint64 transferred = IConfidentialFungibleToken(cAsset).confidentialTransferFrom(
-            address(this),
-            _receiver,
-            _finalWithdrawAmount
-        );
+        euint64 transferred = ERC7984(cAsset).confidentialTransferFrom(address(this), _receiver, _finalWithdrawAmount);
 
         ebool isTransferred = FHE.eq(transferred, _finalWithdrawAmount);
 
@@ -198,20 +193,27 @@ contract cERC4626V2 is MintableConfidentialFungibleToken {
         _burn(_caller, burnAmount);
     }
 
-    function updateSnapshot() external {
-        snapshotTotalAssets = totalAssets();
-        snapshotTotalShares = totalShares();
+    function updateSnapshot() external onlyVaultManager {
+        // snapshotTotalAssets = totalAssets();
+        // snapshotTotalShares = totalShares();
 
-        FHE.allow(snapshotTotalAssets, vaultManager);
-        FHE.allow(snapshotTotalShares, vaultManager);
+        FHE.allow(totalAssets(), vaultManager);
+        FHE.allow(totalShares(), vaultManager);
     }
 
-    function finalizeUpdateRatio(uint256 requestID, bool isCorrect, bytes[] memory signatures) external virtual {
-        // must be at the top of the function (there in assembly relate to calldata layout int the FHE.sol)
-        FHE.checkSignatures(requestID, signatures);
+    function finalizeUpdateRatio(
+        uint256 requestId,
+        bytes memory abiEncodedCheckResult,
+        bytes memory decryptionProof
+    ) external virtual {
+        // Creating the list of handles in the right order! In this case the order does not matter since the proof
+        bytes32[] memory cts = new bytes32[](1);
+        cts[0] = FHE.toBytes32(requests[requestId].isCorrect);
 
-        if (isCorrect) {
-            ratio = requestRatio[requestID];
+        FHE.checkSignatures(cts, abiEncodedCheckResult, decryptionProof);
+        bool decodedIsCorrect = abi.decode(abiEncodedCheckResult, (bool));
+        if (decodedIsCorrect) {
+            ratio = requests[requestId].newRatio;
         }
     }
 
@@ -223,8 +225,8 @@ contract cERC4626V2 is MintableConfidentialFungibleToken {
     ) external virtual {
         euint64 residual = FHE.fromExternal(inputResidual, inputProof);
 
-        euint64 _totalShares = snapshotTotalShares;
-        euint64 _totalAssets = snapshotTotalAssets;
+        euint64 _totalShares = totalShares();
+        euint64 _totalAssets = totalAssets();
 
         euint64 calTotalShares = FHE.div(FHE.mul(_totalAssets, newRatio), BASE_RATE);
         calTotalShares = FHE.add(calTotalShares, residual);
@@ -233,11 +235,13 @@ contract cERC4626V2 is MintableConfidentialFungibleToken {
         ebool secondCondition = FHE.eq(calTotalShares, _totalShares);
 
         // Optimize array creation by using fixed size array
-        bytes32[] memory cts = new bytes32[](1);
-        cts[0] = ebool.unwrap(FHE.and(firstCondition, secondCondition));
+        ebool isCorrect = FHE.and(firstCondition, secondCondition);
 
         // request decryption if both conditions are true
-        uint256 requestID = FHE.requestDecryption(cts, cERC4626V2.finalizeUpdateRatio.selector);
-        requestRatio[requestID] = newRatio;
+        FHE.makePubliclyDecryptable(isCorrect);
+        requestCounter++;
+        requests[requestCounter] = Request(newRatio, isCorrect);
+
+        emit EventRequestUpdateRatio(requestCounter, newRatio);
     }
 }
