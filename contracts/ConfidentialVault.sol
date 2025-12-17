@@ -16,22 +16,51 @@ contract ConfidentialVault is ERC7984MintableBurnable {
         ebool isCorrect;
     }
 
+    struct SubmitPosition {
+        address token;
+        externalEuint64 weight;
+        uint64 riskFactor;
+    }
+
+    struct Position {
+        address token;
+        euint64 weight;
+    }
+
+    struct SubmitStrategy {
+        uint64 maxRiskFactor;
+        uint64 minRiskFactor;
+        SubmitPosition[] positions;
+    }
+
+    struct Strategy {
+        Position[] positions;
+        euint64 totalAssets;
+        ebool isValid;
+        bool isCompleted;
+    }
+
     uint8 private constant PRECISION_DECIMALS = 6;
+    uint64 private constant ONE_HUNDRED_PERCENT = 10000; // 100%
     uint64 private constant BASE_RATE = uint64(10 ** PRECISION_DECIMALS);
 
-    address private immutable cAsset;
-    address public vaultManager;
-    uint64 public ratio;
     bool public isOpen;
+    uint64 public ratio;
+    address public vaultManager;
+    address private immutable cAsset;
 
+    uint8 private _underlyingDecimals;
     euint64 public snapshotTotalAssets;
     euint64 public snapshotTotalShares;
 
     uint256 public requestCounter;
+    uint256 public strategyCounter;
+
+    mapping(uint256 strategyId => Strategy) public pendingStrategies;
+    mapping(uint256 strategyId => bool isFinalized) public isFinalized;
+    uint256 public currentStrategyId;
 
     mapping(uint256 requestId => Request request) public requests;
-
-    uint8 private _underlyingDecimals;
 
     error NotOpen();
     error InvalidVaultManager();
@@ -194,11 +223,11 @@ contract ConfidentialVault is ERC7984MintableBurnable {
     }
 
     function updateSnapshot() external onlyVaultManager {
-        // snapshotTotalAssets = totalAssets();
-        // snapshotTotalShares = totalShares();
+        snapshotTotalAssets = totalAssets();
+        snapshotTotalShares = totalShares();
 
-        FHE.allow(totalAssets(), vaultManager);
-        FHE.allow(totalShares(), vaultManager);
+        FHE.allow(snapshotTotalAssets, vaultManager);
+        FHE.allow(snapshotTotalShares, vaultManager);
     }
 
     function finalizeUpdateRatio(
@@ -243,5 +272,71 @@ contract ConfidentialVault is ERC7984MintableBurnable {
         requests[requestCounter] = Request(newRatio, isCorrect);
 
         emit EventRequestUpdateRatio(requestCounter, newRatio);
+    }
+
+    function finalizeUpdateStrategy(
+        uint256 strategyId,
+        bytes memory abiEncodedCheckResult,
+        bytes memory decryptionProof
+    ) external virtual {
+        require(!isFinalized[strategyId], "Strategy is already finalized");
+        isFinalized[strategyId] = true;
+
+        // Creating the list of handles in the right order! In this case the order does not matter since the proof
+        bytes32[] memory cts = new bytes32[](1);
+        cts[0] = FHE.toBytes32(pendingStrategies[strategyId].isValid);
+
+        FHE.checkSignatures(cts, abiEncodedCheckResult, decryptionProof);
+        bool decodedIsCorrect = abi.decode(abiEncodedCheckResult, (bool));
+        if (decodedIsCorrect) {
+            currentStrategyId = strategyId;
+        }
+    }
+
+    function submitStrategy(SubmitStrategy memory strategy, bytes calldata inputProof) external onlyVaultManager {
+        SubmitPosition[] memory positions = strategy.positions;
+
+        euint64 totalWeight = FHE.asEuint64(0);
+        euint64 totalRiskFactor = FHE.asEuint64(0);
+
+        // create Position structs
+        Position[] memory convertedPositions = new Position[](positions.length);
+
+        for (uint256 i = 0; i < positions.length; i++) {
+            SubmitPosition memory position = positions[i];
+            euint64 weight = FHE.fromExternal(position.weight, inputProof);
+            totalWeight = FHE.add(totalWeight, weight);
+            totalRiskFactor = FHE.add(totalRiskFactor, FHE.mul(position.riskFactor, weight));
+
+            convertedPositions[i] = Position({token: position.token, weight: weight});
+        }
+
+        totalRiskFactor = FHE.div(totalRiskFactor, ONE_HUNDRED_PERCENT);
+
+        ebool isTotalWeightValid = FHE.eq(totalWeight, ONE_HUNDRED_PERCENT);
+
+        ebool isTotalRiskFactorLessThanMax = FHE.le(totalRiskFactor, strategy.maxRiskFactor);
+        ebool isTotalRiskFactorGreaterThanMin = FHE.ge(totalRiskFactor, strategy.minRiskFactor);
+        ebool isTotalRiskFactorValid = FHE.and(isTotalRiskFactorLessThanMax, isTotalRiskFactorGreaterThanMin);
+
+        // sum conditions
+        ebool isTotalValid = FHE.and(isTotalWeightValid, isTotalRiskFactorValid);
+
+        // reveal the final condition
+        FHE.makePubliclyDecryptable(isTotalValid);
+
+        // save strategy to storage
+        strategyCounter++;
+
+        Strategy storage pendingStrategy = pendingStrategies[strategyCounter];
+        pendingStrategy.totalAssets = totalAssets();
+        pendingStrategy.isValid = isTotalValid;
+        pendingStrategy.isCompleted = false;
+
+        // Then copy each position by creating a new Position struct and pushing it
+        for (uint256 i = 0; i < convertedPositions.length; i++) {
+            Position memory position = convertedPositions[i];
+            pendingStrategy.positions.push(Position({token: position.token, weight: position.weight}));
+        }
     }
 }
