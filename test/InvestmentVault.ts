@@ -9,6 +9,8 @@ import {
   ERC7984MintableBurnable,
   ConfidentialVault__factory,
   ERC7984MintableBurnable__factory,
+  Protocol,
+  Protocol__factory,
 } from "../types";
 
 // Constants for better maintainability
@@ -19,6 +21,8 @@ const BASE_RATE = 1_000_000n; // 10^6
 const TEST_AMOUNTS = {
   aliceMint: 1_000_000n,
   bobMint: 2_000_000n,
+  protocolMint: 1_000_000_000_000n,
+  protocolAllocate: 1_600_000n,
   aliceDeposit: 400_000n,
   bobDeposit: 1_200_000n,
   yieldToVault: 600_000n,
@@ -32,7 +36,7 @@ type Signers = {
 };
 
 type ClearPosition = {
-  token: string;
+  protocol: string;
   weight: bigint;
   riskFactor: bigint;
 };
@@ -63,20 +67,20 @@ class TestHelpers {
   }
 
   /**
-   * Converts a ClearStrategy to ConfidentialVault.SubmitStrategyStruct
+   * Converts a ClearStrategy to ConfidentialVault.ProposeStrategyStruct
    * Encrypts weights using createEncryptedStrategy, encrypts totalAssets separately,
    * and sets isValid to empty bytes (default encrypted boolean)
    * @param vaultAddress The address of the ConfidentialVault contract
    * @param user The signer to use for encryption
    * @param clearStrategy The clear strategy to convert
-   * @returns An object containing the SubmitStrategyStruct and the inputProof needed for contract calls
+   * @returns An object containing the ProposeStrategyStruct and the inputProof needed for contract calls
    */
-  static async convertClearStrategyToSubmitStrategyStruct(
+  static async convertClearStrategyToProposeStrategyStruct(
     vaultAddress: string,
     user: HardhatEthersSigner,
     clearStrategy: ClearStrategy,
   ): Promise<{
-    strategy: ConfidentialVault.SubmitStrategyStruct;
+    strategy: ConfidentialVault.ProposeStrategyStruct;
     weightsInputProof: Uint8Array<ArrayBufferLike>;
   }> {
     // Encrypt weights for all positions using createEncryptedStrategy
@@ -85,18 +89,18 @@ class TestHelpers {
 
     // Create encrypted positions array with encrypted weights
     // Each position uses a handle from the encryptedWeights array
-    const encryptedPositions: ConfidentialVault.SubmitPositionStruct[] = [];
+    const encryptedPositions: ConfidentialVault.ProposePositionStruct[] = [];
     for (let i = 0; i < clearStrategy.positions.length; i++) {
       const position = clearStrategy.positions[i];
       encryptedPositions.push({
-        token: position.token,
+        protocol: position.protocol,
         weight: encryptedWeights.handles[i], // Use the corresponding encrypted weight handle
         riskFactor: Number(position.riskFactor), // Convert to number for uint64
       });
     }
 
-    // Create the SubmitStrategy struct
-    const strategyStruct: ConfidentialVault.SubmitStrategyStruct = {
+    // Create the ProposeStrategy struct
+    const strategyStruct: ConfidentialVault.ProposeStrategyStruct = {
       maxRiskFactor: Number(clearStrategy.maxRiskFactor), // Convert to number for uint64
       minRiskFactor: Number(clearStrategy.minRiskFactor), // Convert to number for uint64
       positions: encryptedPositions,
@@ -119,14 +123,14 @@ class TestHelpers {
    * Mints confidential tokens to a user using the simple mint function
    */
   static async mintToUser(
-    someToken: ERC7984MintableBurnable,
+    underlying: ERC7984MintableBurnable,
     mintToAddress: string,
     amount: bigint,
     deployer: HardhatEthersSigner,
     user?: HardhatEthersSigner, //  to get decrypted balance
   ) {
     // Get contract address
-    const contractAddress = await someToken.getAddress();
+    const contractAddress = await underlying.getAddress();
 
     // Create encrypted input for the deployer (who will call the mint function)
     // Following the pattern from FHECounter: encrypted input is created for the caller's address
@@ -134,9 +138,9 @@ class TestHelpers {
 
     // Mint tokens to the specified address (deployer calls as owner)
     // The proof is created by deployer, but tokens are minted to mintToAddress
-    await someToken.connect(deployer).mint(mintToAddress, encrypted.handles[0], encrypted.inputProof);
+    await underlying.connect(deployer).mint(mintToAddress, encrypted.handles[0], encrypted.inputProof);
 
-    const balance = await someToken.confidentialBalanceOf(mintToAddress);
+    const balance = await underlying.confidentialBalanceOf(mintToAddress);
 
     let clearBalance = undefined;
 
@@ -144,7 +148,7 @@ class TestHelpers {
       clearBalance = await fhevm.userDecryptEuint(
         FhevmType.euint64,
         balance.toString(),
-        await someToken.getAddress(),
+        await underlying.getAddress(),
         user,
       );
     }
@@ -154,9 +158,9 @@ class TestHelpers {
   /**
    * Sets operator for confidential transfers
    */
-  static async setOperator(someToken: ERC7984MintableBurnable, user: HardhatEthersSigner, operatorAddress: string) {
+  static async setOperator(underlying: ERC7984MintableBurnable, user: HardhatEthersSigner, operatorAddress: string) {
     const expiry = BigInt((await time.latest()) + OPERATOR_EXPIRY_OFFSET);
-    await someToken.connect(user).setOperator(operatorAddress, expiry);
+    await underlying.connect(user).setOperator(operatorAddress, expiry);
   }
 
   /**
@@ -237,10 +241,10 @@ class TestHelpers {
    */
   static async convertToShares(
     vault: ConfidentialVault,
-    someToken: ERC7984MintableBurnable,
+    underlying: ERC7984MintableBurnable,
     user: HardhatEthersSigner,
   ) {
-    const { clearBalance: assetBalance } = await this.getDecryptedBalance(someToken, user, user.address);
+    const { clearBalance: assetBalance } = await this.getDecryptedBalance(tokenAsset, user, user.address);
     const ratio = await vault.ratio();
     const computedShares = (assetBalance * ratio) / BASE_RATE;
     return { assetBalance, computedShares };
@@ -292,12 +296,12 @@ class TestHelpers {
 describe("ConfidentialVault deposit/ratio/withdraw flow", function () {
   // Cached variables for better performance
   let signers: Signers;
-  let someToken: ERC7984MintableBurnable;
-  let someToken2: ERC7984MintableBurnable;
-  let someToken3: ERC7984MintableBurnable;
-  let someToken4: ERC7984MintableBurnable;
-  let someToken5: ERC7984MintableBurnable;
-
+  let underlying: ERC7984MintableBurnable;
+  let protocol1: Protocol;
+  let protocol2: Protocol;
+  let protocol3: Protocol;
+  let protocol4: Protocol;
+  let protocol5: Protocol;
   let vault: ConfidentialVault;
   let someTokenAddress: string;
   let vaultAddress: string;
@@ -314,39 +318,42 @@ describe("ConfidentialVault deposit/ratio/withdraw flow", function () {
       throw new Error("This hardhat test suite cannot run on Sepolia Testnet");
     }
 
-    // Deploy someToken confidential tokens using the helper function
-    someToken = await TestHelpers.deployERC7984MintableBurnable(signers.deployer, "Underlying", "uTKN");
-    someToken2 = await TestHelpers.deployERC7984MintableBurnable(signers.deployer, "Underlying2", "uTKN2");
-    someToken3 = await TestHelpers.deployERC7984MintableBurnable(signers.deployer, "Underlying3", "uTKN3");
-    someToken4 = await TestHelpers.deployERC7984MintableBurnable(signers.deployer, "Underlying4", "uTKN4");
-    someToken5 = await TestHelpers.deployERC7984MintableBurnable(signers.deployer, "Underlying5", "uTKN5");
+    // Deploy underlying confidential tokens using the helper function
+    underlying = await TestHelpers.deployERC7984MintableBurnable(signers.deployer, "Underlying", "uTKN");
+
+    // Deploy protocols
+    protocol1 = await new Protocol__factory(signers.deployer).deploy();
+    protocol2 = await new Protocol__factory(signers.deployer).deploy();
+    protocol3 = await new Protocol__factory(signers.deployer).deploy();
+    protocol4 = await new Protocol__factory(signers.deployer).deploy();
+    protocol5 = await new Protocol__factory(signers.deployer).deploy();
 
     clearStrategy = {
       maxRiskFactor: 6000n, // 60%
       minRiskFactor: 1000n, // 10%
       positions: [
         {
-          token: await someToken.getAddress(),
+          protocol: await protocol1.getAddress(),
           weight: 2500n, // 25%
           riskFactor: 2200n, // 22%
         },
         {
-          token: await someToken2.getAddress(),
+          protocol: await protocol2.getAddress(),
           weight: 2000n, // 20%
           riskFactor: 1000n, // 10%
         },
         {
-          token: await someToken3.getAddress(),
+          protocol: await protocol3.getAddress(),
           weight: 1500n, // 15%
           riskFactor: 3500n, // 35%
         },
         {
-          token: await someToken4.getAddress(),
+          protocol: await protocol4.getAddress(),
           weight: 2500n, // 25%
           riskFactor: 1500n, // 15%
         },
         {
-          token: await someToken5.getAddress(),
+          protocol: await protocol5.getAddress(),
           weight: 1500n, // 15%
           riskFactor: 2800n, // 28%
         },
@@ -359,18 +366,18 @@ describe("ConfidentialVault deposit/ratio/withdraw flow", function () {
         "Vault Share",
         "vSHARE",
         "",
-        await someToken.getAddress(),
+        await underlying.getAddress(),
       )
     ).waitForDeployment()) as ConfidentialVault;
 
     // Cache addresses for better performance
-    someTokenAddress = await someToken.getAddress();
+    someTokenAddress = await underlying.getAddress();
     vaultAddress = await vault.getAddress();
     initialRatio = await vault.ratio();
 
     // Log setup information
     console.table({
-      "someToken address": someTokenAddress,
+      "underlying address": someTokenAddress,
       "vault address": vaultAddress,
       "initial ratio": initialRatio.toString(),
     });
@@ -419,7 +426,7 @@ describe("ConfidentialVault deposit/ratio/withdraw flow", function () {
     });
 
     it("Should submit strategy", async function () {
-      const { strategy, weightsInputProof } = await TestHelpers.convertClearStrategyToSubmitStrategyStruct(
+      const { strategy, weightsInputProof } = await TestHelpers.convertClearStrategyToProposeStrategyStruct(
         vaultAddress,
         signers.deployer,
         clearStrategy,
@@ -460,6 +467,184 @@ describe("ConfidentialVault deposit/ratio/withdraw flow", function () {
       // get current strategy id
       const currentStrategyId = await vault.currentStrategyId();
       expect(currentStrategyId).to.eq(strategyCounter);
+    });
+
+    it("Should mint underlying to Alice and Bob and protocols", async function () {
+      await TestHelpers.mintToUser(
+        underlying,
+        signers.alice.address,
+        TEST_AMOUNTS.aliceMint,
+        signers.deployer,
+        signers.alice,
+      );
+      await TestHelpers.mintToUser(
+        underlying,
+        signers.bob.address,
+        TEST_AMOUNTS.bobMint,
+        signers.deployer,
+        signers.bob,
+      );
+      await TestHelpers.mintToUser(
+        underlying,
+        await protocol1.getAddress(),
+        TEST_AMOUNTS.protocolMint,
+        signers.deployer,
+      );
+      await TestHelpers.mintToUser(
+        underlying,
+        await protocol2.getAddress(),
+        TEST_AMOUNTS.protocolMint,
+        signers.deployer,
+      );
+      await TestHelpers.mintToUser(
+        underlying,
+        await protocol3.getAddress(),
+        TEST_AMOUNTS.protocolMint,
+        signers.deployer,
+      );
+      await TestHelpers.mintToUser(
+        underlying,
+        await protocol4.getAddress(),
+        TEST_AMOUNTS.protocolMint,
+        signers.deployer,
+      );
+      await TestHelpers.mintToUser(
+        underlying,
+        await protocol5.getAddress(),
+        TEST_AMOUNTS.protocolMint,
+        signers.deployer,
+      );
+    });
+
+    it("Should allow Alice to deposit when vault is open", async function () {
+      await TestHelpers.setOperator(underlying, signers.alice, vaultAddress);
+
+      const { clearShares } = await TestHelpers.performDeposit(
+        vault,
+        signers.alice,
+        TEST_AMOUNTS.aliceDeposit,
+        vaultAddress,
+      );
+
+      // With initial ratio = BASE_RATE, shares = assets * (BASE_RATE / BASE_RATE) = assets
+      const expectedShares = TEST_AMOUNTS.aliceDeposit;
+      expect(clearShares).to.eq(expectedShares);
+    });
+
+    it("Should allow Bob to deposit when vault is open", async function () {
+      await TestHelpers.setOperator(underlying, signers.bob, vaultAddress);
+
+      const { clearShares } = await TestHelpers.performDeposit(
+        vault,
+        signers.bob,
+        TEST_AMOUNTS.bobDeposit,
+        vaultAddress,
+      );
+
+      const expectedShares = TEST_AMOUNTS.bobDeposit;
+      expect(clearShares).to.eq(expectedShares);
+    });
+
+    it("Should allocate strategy", async function () {
+      await vault.connect(signers.deployer).allocateStrategy();
+    });
+
+    it("Increase allocated amount for protocols", async function () {
+      const encrypted = await fhevm
+        .createEncryptedInput(await protocol1.getAddress(), signers.deployer.address)
+        .add64(TEST_AMOUNTS.protocolAllocate)
+        .encrypt();
+
+      await protocol1
+        .connect(signers.deployer)
+        .increaseAllocatedAmount(vaultAddress, encrypted.handles[0], encrypted.inputProof);
+    });
+
+    it("Should deallocate strategy", async function () {
+      await vault.connect(signers.deployer).deallocateStrategy();
+
+      // snapshot the vault
+      await vault.connect(signers.deployer).updateSnapshot();
+
+      // get contract total assets after deallocation
+      const totalAssetsAfter = await vault.totalAssets();
+      const clearTotalAssetsAfter = await fhevm.userDecryptEuint(
+        FhevmType.euint64,
+        totalAssetsAfter.toString(),
+        vaultAddress,
+        signers.deployer,
+      );
+
+      expect(clearTotalAssetsAfter).to.eq(
+        TEST_AMOUNTS.aliceDeposit + TEST_AMOUNTS.bobDeposit + TEST_AMOUNTS.protocolAllocate,
+      );
+    });
+
+    it("Test request ratio update after yield", async function () {
+      const totalShares = TEST_AMOUNTS.aliceDeposit + TEST_AMOUNTS.bobDeposit;
+      const totalAssetsAfterYield = totalShares + TEST_AMOUNTS.yieldToVault;
+
+      const newRatio = (totalShares * BASE_RATE) / totalAssetsAfterYield;
+      const calculatedShares = (totalAssetsAfterYield * newRatio) / BASE_RATE;
+
+      const residual = totalShares - calculatedShares;
+
+      const encryptedResidual = await TestHelpers.createEncryptedDeposit(vaultAddress, signers.deployer, residual);
+
+      const tx = await vault
+        .connect(signers.deployer)
+        .requestUpdateRatio(newRatio, encryptedResidual.handles[0], encryptedResidual.inputProof);
+
+      const receipt = await tx.wait();
+      void expect(receipt).to.not.be.null;
+    });
+
+    it("Test Alice redeem shares for assets", async function () {
+      // get ratio before update
+      const ratioBefore = await vault.ratio();
+
+      // get request id from contract
+      const requestId = await vault.requestCounter();
+
+      // get request decrypt bool from contract
+      const requestDecryptBool = (await vault.requests(requestId)).isCorrect;
+
+      // Call the Zama Relayer to compute the decryption
+      const publicDecryptResults = await fhevm.publicDecrypt([requestDecryptBool]);
+
+      const abiEncodedClearRequestDecryptBool = publicDecryptResults.abiEncodedClearValues;
+      const decryptionProof = publicDecryptResults.decryptionProof;
+
+      // call to contract to finalize the ratio update
+      await vault
+        .connect(signers.deployer)
+        .finalizeUpdateRatio(requestId, abiEncodedClearRequestDecryptBool, decryptionProof);
+
+      const { clearBalance: beforeBalance } = await TestHelpers.getDecryptedBalance(
+        underlying,
+        signers.alice,
+        signers.alice.address,
+      );
+
+      // get current share of alice
+      const { clearBalance: aliceShares } = await TestHelpers.getDecryptedBalance(
+        vault,
+        signers.alice,
+        signers.alice.address,
+      );
+
+      await TestHelpers.performRedeem(vault, signers.alice, aliceShares, vaultAddress);
+
+      const { clearBalance: afterBalance } = await TestHelpers.getDecryptedBalance(
+        underlying,
+        signers.alice,
+        signers.alice.address,
+      );
+
+      const ratioAfter = await vault.ratio();
+
+      // Check underlying increased by withdrawn assets
+      expect(afterBalance - beforeBalance).to.eq((TEST_AMOUNTS.aliceDeposit * ratioBefore) / ratioAfter);
     });
   });
 });

@@ -4,6 +4,7 @@ pragma solidity ^0.8.27;
 import {FHE, externalEuint64, euint64, ebool} from "@fhevm/solidity/lib/FHE.sol";
 import {ERC7984} from "@openzeppelin/confidential-contracts/token/ERC7984/ERC7984.sol";
 import {ERC7984MintableBurnable} from "./ERC7984MintableBurnable.sol";
+import {Protocol} from "./Protocol.sol";
 
 /**
  * @title ConfidentialVault
@@ -16,21 +17,21 @@ contract ConfidentialVault is ERC7984MintableBurnable {
         ebool isCorrect;
     }
 
-    struct SubmitPosition {
-        address token;
+    struct ProposePosition {
+        address protocol;
         externalEuint64 weight;
         uint64 riskFactor;
     }
 
-    struct Position {
-        address token;
-        euint64 weight;
-    }
-
-    struct SubmitStrategy {
+    struct ProposeStrategy {
         uint64 maxRiskFactor;
         uint64 minRiskFactor;
-        SubmitPosition[] positions;
+        ProposePosition[] positions;
+    }
+
+    struct Position {
+        address protocol;
+        euint64 weight;
     }
 
     struct Strategy {
@@ -55,12 +56,11 @@ contract ConfidentialVault is ERC7984MintableBurnable {
 
     uint256 public requestCounter;
     uint256 public strategyCounter;
-
-    mapping(uint256 strategyId => Strategy) public pendingStrategies;
-    mapping(uint256 strategyId => bool isFinalized) public isFinalized;
     uint256 public currentStrategyId;
 
+    mapping(uint256 strategyId => Strategy) public pendingStrategies;
     mapping(uint256 requestId => Request request) public requests;
+    mapping(uint256 strategyId => bool isFinalized) public isFinalized;
 
     error NotOpen();
     error InvalidVaultManager();
@@ -232,8 +232,8 @@ contract ConfidentialVault is ERC7984MintableBurnable {
 
     function finalizeUpdateRatio(
         uint256 requestId,
-        bytes memory abiEncodedCheckResult,
-        bytes memory decryptionProof
+        bytes calldata abiEncodedCheckResult,
+        bytes calldata decryptionProof
     ) external virtual {
         // Creating the list of handles in the right order! In this case the order does not matter since the proof
         bytes32[] memory cts = new bytes32[](1);
@@ -293,8 +293,8 @@ contract ConfidentialVault is ERC7984MintableBurnable {
         }
     }
 
-    function submitStrategy(SubmitStrategy memory strategy, bytes calldata inputProof) external onlyVaultManager {
-        SubmitPosition[] memory positions = strategy.positions;
+    function submitStrategy(ProposeStrategy memory strategy, bytes calldata inputProof) external onlyVaultManager {
+        ProposePosition[] memory positions = strategy.positions;
 
         euint64 totalWeight = FHE.asEuint64(0);
         euint64 totalRiskFactor = FHE.asEuint64(0);
@@ -303,12 +303,12 @@ contract ConfidentialVault is ERC7984MintableBurnable {
         Position[] memory convertedPositions = new Position[](positions.length);
 
         for (uint256 i = 0; i < positions.length; i++) {
-            SubmitPosition memory position = positions[i];
+            ProposePosition memory position = positions[i];
             euint64 weight = FHE.fromExternal(position.weight, inputProof);
             totalWeight = FHE.add(totalWeight, weight);
             totalRiskFactor = FHE.add(totalRiskFactor, FHE.mul(position.riskFactor, weight));
 
-            convertedPositions[i] = Position({token: position.token, weight: weight});
+            convertedPositions[i] = Position({protocol: position.protocol, weight: weight});
         }
 
         totalRiskFactor = FHE.div(totalRiskFactor, ONE_HUNDRED_PERCENT);
@@ -329,14 +329,50 @@ contract ConfidentialVault is ERC7984MintableBurnable {
         strategyCounter++;
 
         Strategy storage pendingStrategy = pendingStrategies[strategyCounter];
-        pendingStrategy.totalAssets = totalAssets();
+        euint64 _totalAssets = totalAssets();
+        pendingStrategy.totalAssets = _totalAssets;
+
         pendingStrategy.isValid = isTotalValid;
         pendingStrategy.isCompleted = false;
 
         // Then copy each position by creating a new Position struct and pushing it
         for (uint256 i = 0; i < convertedPositions.length; i++) {
             Position memory position = convertedPositions[i];
-            pendingStrategy.positions.push(Position({token: position.token, weight: position.weight}));
+            pendingStrategy.positions.push(Position({protocol: position.protocol, weight: position.weight}));
+            FHE.allowThis(position.weight);
+        }
+    }
+
+    function allocateStrategy() external onlyVaultManager {
+        Strategy storage strategy = pendingStrategies[currentStrategyId];
+        // require strategy to be finalized
+        require(isFinalized[currentStrategyId], "Strategy is not finalized");
+        require(!strategy.isCompleted, "Strategy is not completed");
+        strategy.isCompleted = true;
+        euint64 totalAllocatedAmount = strategy.totalAssets;
+
+        // allocate strategy
+        for (uint256 i = 0; i < strategy.positions.length; i++) {
+            Position memory position = strategy.positions[i];
+
+            // allocate position
+            euint64 allocatedAmount = FHE.div(FHE.mul(totalAllocatedAmount, position.weight), ONE_HUNDRED_PERCENT);
+            FHE.allowTransient(allocatedAmount, position.protocol);
+            FHE.allowTransient(allocatedAmount, cAsset);
+            // approve protocol to spend the allocated amount
+            ERC7984(cAsset).setOperator(position.protocol, uint48(block.timestamp + 1000));
+            Protocol(position.protocol).allocatePosition(cAsset, allocatedAmount);
+        }
+    }
+
+    function deallocateStrategy() external onlyVaultManager {
+        Strategy storage strategy = pendingStrategies[currentStrategyId];
+        require(strategy.isCompleted, "Strategy is not completed");
+        currentStrategyId = 0;
+
+        for (uint256 i = 0; i < strategy.positions.length; i++) {
+            Position memory position = strategy.positions[i];
+            Protocol(position.protocol).deallocatePosition(cAsset);
         }
     }
 }
