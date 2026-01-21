@@ -33,12 +33,16 @@ contract ConfidentialVault is ERC7984MintableBurnable {
         address protocol;
         euint64 weight;
     }
-
     struct Strategy {
         Position[] positions;
         euint64 totalAssets;
         ebool isValid;
         bool isCompleted;
+    }
+
+    struct AllocatedAmount {
+        address protocol;
+        euint64 allocatedAmount;
     }
 
     uint8 private constant PRECISION_DECIMALS = 6;
@@ -61,6 +65,8 @@ contract ConfidentialVault is ERC7984MintableBurnable {
     mapping(uint256 strategyId => Strategy) public pendingStrategies;
     mapping(uint256 requestId => Request request) public requests;
     mapping(uint256 strategyId => bool isFinalized) public isFinalized;
+
+    AllocatedAmount[] private _allocatedStrategyAmounts;
 
     error NotOpen();
     error InvalidVaultManager();
@@ -374,5 +380,27 @@ contract ConfidentialVault is ERC7984MintableBurnable {
             Position memory position = strategy.positions[i];
             Protocol(position.protocol).deallocatePosition(cAsset);
         }
+    }
+
+    function getCurrentAllocatedAmount() external onlyVaultManager {
+        delete _allocatedStrategyAmounts;
+
+        Strategy storage strategy = pendingStrategies[currentStrategyId];
+
+        for (uint256 i = 0; i < strategy.positions.length; i++) {
+            Position memory position = strategy.positions[i];
+
+            euint64 allocatedAmount = Protocol(position.protocol).getAllocatedAmount();
+
+            FHE.allow(allocatedAmount, vaultManager);
+
+            _allocatedStrategyAmounts.push(
+                AllocatedAmount({protocol: position.protocol, allocatedAmount: allocatedAmount})
+            );
+        }
+    }
+
+    function viewCurrentAllocatedAmount() external view returns (AllocatedAmount[] memory) {
+        return _allocatedStrategyAmounts;
     }
 }

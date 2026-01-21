@@ -19,6 +19,7 @@ contract Protocol is ZamaEthereumConfig {
         allocatedAmount[msg.sender] = FHE.add(allocatedAmount[msg.sender], amount);
 
         FHE.allowThis(allocatedAmount[msg.sender]);
+        FHE.allow(allocatedAmount[msg.sender], msg.sender);
     }
 
     function deallocatePosition(address token) public returns (euint64) {
@@ -28,6 +29,8 @@ contract Protocol is ZamaEthereumConfig {
         ERC7984(token).confidentialTransfer(msg.sender, amount);
 
         allocatedAmount[msg.sender] = FHE.asEuint64(0);
+
+        FHE.allow(allocatedAmount[msg.sender], msg.sender);
 
         return amount;
     }
@@ -41,6 +44,7 @@ contract Protocol is ZamaEthereumConfig {
         allocatedAmount[allocator] = FHE.add(allocatedAmount[allocator], _amount);
 
         FHE.allowThis(allocatedAmount[allocator]);
+        FHE.allow(allocatedAmount[allocator], allocator);
     }
 
     function decreaseAllocatedAmount(address allocator, externalEuint64 amount, bytes calldata inputProof) public {
@@ -50,5 +54,6 @@ contract Protocol is ZamaEthereumConfig {
         allocatedAmount[allocator] = updated;
 
         FHE.allowThis(allocatedAmount[allocator]);
+        FHE.allow(allocatedAmount[allocator], allocator);
     }
 }

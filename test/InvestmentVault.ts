@@ -560,6 +560,30 @@ describe("ConfidentialVault deposit/ratio/withdraw flow", function () {
         .increaseAllocatedAmount(vaultAddress, encrypted.handles[0], encrypted.inputProof);
     });
 
+    it("Show the allocated amount for protocols", async function () {
+      await vault.getCurrentAllocatedAmount();
+
+      const allocatedAmounts = await vault.viewCurrentAllocatedAmount();
+
+      const clearAllocatedAmounts: {protocol: string, allocatedAmount: bigint}[] = [];
+
+      for (const allocatedAmount of allocatedAmounts) {
+        const clearAllocatedAmount = await fhevm.userDecryptEuint(
+          FhevmType.euint64,
+          allocatedAmount.allocatedAmount.toString(),
+          allocatedAmount.protocol,
+          signers.deployer,
+        );
+
+        clearAllocatedAmounts.push({
+          protocol: allocatedAmount.protocol,
+          allocatedAmount: clearAllocatedAmount,
+        });
+      }
+
+      console.log("clearAllocatedAmounts: ", clearAllocatedAmounts);
+    });
+
     it("Should deallocate strategy", async function () {
       await vault.connect(signers.deployer).deallocateStrategy();
 
