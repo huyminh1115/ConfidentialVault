@@ -3,20 +3,29 @@ import { task } from "hardhat/config";
 import type { TaskArguments } from "hardhat/types";
 
 /**
- * Task to mint underlying tokens to Protocol 1-5
+ * Task to mint underlying tokens to a single address
  *
- * This task mints 1_000_000 tokens to each of the 5 Protocol contracts.
+ * This task mints 1_000_000 tokens to a specific address you provide.
  * The underlying token must be deployed first using the InvestmentVault deploy script.
  *
  * Usage:
- *   npx hardhat --network localhost task:mint-to-protocols
- *   npx hardhat --network sepolia task:mint-to-protocols
- *   npx hardhat --network localhost task:mint-to-protocols --amount 2000000
+ *   npx hardhat --network localhost task:mint-to-protocols --to 0x...
+ *   npx hardhat --network sepolia task:mint-to-protocols --to 0x...
+ *   npx hardhat --network localhost task:mint-to-protocols --to 0x... --amount 2000000
  */
-task("task:mint-to-protocols", "Mints underlying tokens to Protocol 1-5")
-  .addOptionalParam("amount", "Amount to mint to each protocol (default: 1000000)", "1000000")
+task("task:mint-to-protocols", "Mints underlying tokens to a single address")
+  // We keep the same task name to avoid breaking existing scripts.
+  // But the behavior is now explicit: mint to ONE destination address only.
+  .addParam("to", "Destination address to mint to (required)")
+  .addOptionalParam("amount", "Amount to mint (default: 1000000)", "1000000")
   .setAction(async function (taskArguments: TaskArguments, hre) {
     const { ethers, deployments, fhevm } = hre;
+
+    // Validate the destination address early. This avoids wasting time on deployments / FHE init.
+    const to = String(taskArguments.to || "").trim();
+    if (!ethers.isAddress(to)) {
+      throw new Error(`Invalid destination address provided via --to: "${to}"`);
+    }
 
     // Parse the amount parameter
     const amount = BigInt(taskArguments.amount || "1000000");
@@ -24,7 +33,7 @@ task("task:mint-to-protocols", "Mints underlying tokens to Protocol 1-5")
       throw new Error("Amount must be greater than 0");
     }
 
-    console.log(`\nMinting ${amount.toString()} tokens to each protocol...\n`);
+    console.log(`\nMinting ${amount.toString()} tokens to ${to}...\n`);
 
     // Initialize FHEVM for CLI operations
     // Handle initialization errors that may occur if contracts are already deployed
@@ -38,7 +47,7 @@ task("task:mint-to-protocols", "Mints underlying tokens to Protocol 1-5")
     let underlyingDeployment;
     try {
       underlyingDeployment = await deployments.get("ERC7984MintableBurnable");
-    } catch (error) {
+    } catch {
       throw new Error(
         "ERC7984MintableBurnable not found. Please deploy it first using: pnpm hardhat deploy --tags InvestmentVault",
       );
@@ -50,86 +59,62 @@ task("task:mint-to-protocols", "Mints underlying tokens to Protocol 1-5")
     // Get the underlying token contract
     const underlyingContract = await ethers.getContractAt("ERC7984MintableBurnable", underlyingAddress);
 
-    // Get all protocol addresses
-    const protocolNames = ["Protocol1", "Protocol2", "Protocol3", "Protocol4", "Protocol5"];
-    const protocolAddresses: string[] = [];
-
-    for (const protocolName of protocolNames) {
-      try {
-        const protocolDeployment = await deployments.get(protocolName);
-        protocolAddresses.push(protocolDeployment.address);
-        console.log(`${protocolName}: ${protocolDeployment.address}`);
-      } catch (error) {
-        throw new Error(
-          `${protocolName} not found. Please deploy protocols first using: pnpm hardhat deploy --tags InvestmentVault`,
-        );
-      }
-    }
-
     console.log("\n" + "=".repeat(60));
     console.log("Starting minting process...");
     console.log("=".repeat(60));
 
-    // Mint tokens to each protocol
-    for (let i = 0; i < protocolAddresses.length; i++) {
-      const protocolAddress = protocolAddresses[i];
-      const protocolName = protocolNames[i];
+    try {
+      console.log(`\nMinting ${amount.toString()} tokens to destination address...`);
 
-      try {
-        console.log(`\n[${i + 1}/5] Minting ${amount.toString()} tokens to ${protocolName}...`);
+      // Create encrypted input for minting.
+      // Important: the encrypted input is created for the deployer's address (the caller).
+      // This matches how the ERC7984 confidential mint expects the proof to be tied to the caller.
+      const encrypted = await fhevm.createEncryptedInput(underlyingAddress, deployer.address).add64(amount).encrypt();
 
-        // Create encrypted input for minting
-        // The encrypted input is created for the deployer's address (the caller)
-        const encrypted = await fhevm.createEncryptedInput(underlyingAddress, deployer.address).add64(amount).encrypt();
+      // Mint tokens to the destination address.
+      // The deployer (owner) calls the mint function.
+      const tx = await underlyingContract.connect(deployer).mint(to, encrypted.handles[0], encrypted.inputProof);
 
-        // Mint tokens to the protocol address
-        // The deployer (owner) calls the mint function
-        const tx = await underlyingContract
-          .connect(deployer)
-          .mint(protocolAddress, encrypted.handles[0], encrypted.inputProof);
+      console.log(`   Transaction hash: ${tx.hash}`);
+      console.log(`   Waiting for confirmation...`);
 
-        console.log(`   Transaction hash: ${tx.hash}`);
-        console.log(`   Waiting for confirmation...`);
-
-        const receipt = await tx.wait();
-        if (!receipt) {
-          throw new Error("Transaction receipt is null");
-        }
-
-        console.log(`   ✓ Transaction confirmed (block: ${receipt.blockNumber}, status: ${receipt.status})`);
-
-        // Verify the balance by getting the encrypted balance
-        const balance = await underlyingContract.confidentialBalanceOf(protocolAddress);
-        console.log(`   ✓ Encrypted balance: ${balance}`);
-
-        // Try to decrypt the balance (only works in mock mode)
-        if (fhevm.isMock) {
-          try {
-            // Get a signer for the protocol (we'll use deployer for decryption)
-            const clearBalance = await fhevm.userDecryptEuint(
-              FhevmType.euint64,
-              balance.toString(),
-              underlyingAddress,
-              deployer,
-            );
-            console.log(`   ✓ Decrypted balance: ${clearBalance.toString()}`);
-          } catch (decryptError) {
-            console.log(`   ⚠ Could not decrypt balance (this is normal on non-mock networks)`);
-          }
-        }
-      } catch (error: any) {
-        console.error(`   ✗ Failed to mint to ${protocolName}:`, error.message);
-        throw error;
+      const receipt = await tx.wait();
+      if (!receipt) {
+        throw new Error("Transaction receipt is null");
       }
+
+      console.log(`   ✓ Transaction confirmed (block: ${receipt.blockNumber}, status: ${receipt.status})`);
+
+      // Verify the balance by getting the encrypted balance
+      const balance = await underlyingContract.confidentialBalanceOf(to);
+      console.log(`   ✓ Encrypted balance: ${balance}`);
+
+      // Try to decrypt the balance (only works in mock mode)
+      if (fhevm.isMock) {
+        try {
+          const clearBalance = await fhevm.userDecryptEuint(
+            FhevmType.euint64,
+            balance.toString(),
+            underlyingAddress,
+            deployer,
+          );
+          console.log(`   ✓ Decrypted balance: ${clearBalance.toString()}`);
+        } catch {
+          console.log(`   ⚠ Could not decrypt balance (this is normal on non-mock networks)`);
+        }
+      }
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : String(err);
+      console.error(`   ✗ Failed to mint to ${to}:`, message);
+      throw err;
     }
 
     console.log("\n" + "=".repeat(60));
     console.log("Minting Summary:");
     console.log("=".repeat(60));
     console.log(`Underlying Token: ${underlyingAddress}`);
-    for (let i = 0; i < protocolAddresses.length; i++) {
-      console.log(`${protocolNames[i]}: ${protocolAddresses[i]} - ${amount.toString()} tokens minted`);
-    }
+    console.log(`Destination: ${to}`);
+    console.log(`Amount: ${amount.toString()}`);
     console.log("=".repeat(60));
     console.log("\n✓ All minting operations completed successfully!");
   });

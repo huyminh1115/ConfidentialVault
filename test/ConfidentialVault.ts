@@ -551,8 +551,8 @@ describe("ConfidentialVault deposit/ratio/withdraw flow", function () {
       await vault.connect(signers.deployer).updateSnapshot();
 
       const vaultAddr = await vault.getAddress();
-      const snapshotAssets = await vault.totalAssets();
-      const snapshotShares = await vault.totalShares();
+      const snapshotAssets = await vault.snapshotTotalAssets();
+      const snapshotShares = await vault.snapshotTotalShares();
 
       const decryptedAssets = await fhevm.userDecryptEuint(
         FhevmType.euint64,

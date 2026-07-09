@@ -13,6 +13,7 @@ import "solidity-coverage";
 // import "./tasks/FHECounter";
 import "./tasks/mintToProtocols";
 import "./tasks/mintToSigners";
+import "./tasks/vaultState";
 
 // Run 'npx hardhat vars setup' to see the list of variables that need to be set
 

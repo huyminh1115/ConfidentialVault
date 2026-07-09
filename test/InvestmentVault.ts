@@ -244,7 +244,8 @@ class TestHelpers {
     underlying: ERC7984MintableBurnable,
     user: HardhatEthersSigner,
   ) {
-    const { clearBalance: assetBalance } = await this.getDecryptedBalance(tokenAsset, user, user.address);
+    // Use the provided underlying token instance (tokenAsset was a stale variable name).
+    const { clearBalance: assetBalance } = await this.getDecryptedBalance(underlying, user, user.address);
     const ratio = await vault.ratio();
     const computedShares = (assetBalance * ratio) / BASE_RATE;
     return { assetBalance, computedShares };
@@ -549,23 +550,12 @@ describe("ConfidentialVault deposit/ratio/withdraw flow", function () {
       await vault.connect(signers.deployer).allocateStrategy();
     });
 
-    it("Increase allocated amount for protocols", async function () {
-      const encrypted = await fhevm
-        .createEncryptedInput(await protocol1.getAddress(), signers.deployer.address)
-        .add64(TEST_AMOUNTS.protocolAllocate)
-        .encrypt();
-
-      await protocol1
-        .connect(signers.deployer)
-        .increaseAllocatedAmount(vaultAddress, encrypted.handles[0], encrypted.inputProof);
-    });
-
-    it("Show the allocated amount for protocols", async function () {
+    it("Show the allocated amount for protocols 1", async function () {
       await vault.getCurrentAllocatedAmount();
 
       const allocatedAmounts = await vault.viewCurrentAllocatedAmount();
 
-      const clearAllocatedAmounts: {protocol: string, allocatedAmount: bigint}[] = [];
+      const clearAllocatedAmounts: { protocol: string; allocatedAmount: bigint }[] = [];
 
       for (const allocatedAmount of allocatedAmounts) {
         const clearAllocatedAmount = await fhevm.userDecryptEuint(
@@ -581,7 +571,104 @@ describe("ConfidentialVault deposit/ratio/withdraw flow", function () {
         });
       }
 
-      console.log("clearAllocatedAmounts: ", clearAllocatedAmounts);
+      console.log("clearAllocatedAmounts protocol 1: ", clearAllocatedAmounts);
+    });
+
+    it("Increase allocated amount for protocols", async function () {
+      const encrypted = await fhevm
+        .createEncryptedInput(await protocol1.getAddress(), signers.deployer.address)
+        .add64(TEST_AMOUNTS.protocolAllocate)
+        .encrypt();
+
+      await protocol1
+        .connect(signers.deployer)
+        .increaseAllocatedAmount(vaultAddress, encrypted.handles[0], encrypted.inputProof);
+    });
+
+    it("Show the allocated amount for protocols 2", async function () {
+      await vault.getCurrentAllocatedAmount();
+
+      const allocatedAmounts = await vault.viewCurrentAllocatedAmount();
+
+      const clearAllocatedAmounts: { protocol: string; allocatedAmount: bigint }[] = [];
+
+      for (const allocatedAmount of allocatedAmounts) {
+        const clearAllocatedAmount = await fhevm.userDecryptEuint(
+          FhevmType.euint64,
+          allocatedAmount.allocatedAmount.toString(),
+          allocatedAmount.protocol,
+          signers.deployer,
+        );
+
+        clearAllocatedAmounts.push({
+          protocol: allocatedAmount.protocol,
+          allocatedAmount: clearAllocatedAmount,
+        });
+      }
+
+      console.log("clearAllocatedAmounts protocol 2: ", clearAllocatedAmounts);
+    });
+
+    it("Should update ratio after first yield", async function () {
+      // We update the ratio right after observing the first allocation increase.
+      // This test does BOTH steps:
+      // - requestUpdateRatio(...)
+      // - finalizeUpdateRatio(...)
+      //
+      // Why we call updateSnapshot():
+      // requestUpdateRatio uses the last snapshot values for its verification.
+      // So we snapshot *now*, with assets including the first yield allocation.
+      await vault.connect(signers.deployer).updateSnapshot();
+
+      // Snapshot values at this point in the test flow:
+      // - total shares: Alice + Bob deposits (ratio was BASE_RATE at deposit time)
+      // - total assets: deposits + first yield allocation
+      const snapshotTotalShares = TEST_AMOUNTS.aliceDeposit + TEST_AMOUNTS.bobDeposit;
+      const snapshotTotalAssets = TEST_AMOUNTS.aliceDeposit + TEST_AMOUNTS.bobDeposit + TEST_AMOUNTS.protocolAllocate;
+
+      // Compute the newRatio + residual exactly like the contract's check:
+      // (snapshotTotalAssets * newRatio) / BASE_RATE + residual == snapshotTotalShares
+      const newRatio = (snapshotTotalShares * BASE_RATE) / snapshotTotalAssets;
+      const calculatedShares = (snapshotTotalAssets * newRatio) / BASE_RATE;
+      const residual = snapshotTotalShares - calculatedShares;
+
+      // Sanity checks mirroring the contract requirements.
+      expect(calculatedShares + residual).to.eq(snapshotTotalShares);
+      expect(residual).to.be.lt(snapshotTotalAssets);
+
+      // Encrypt residual and request the update.
+      const encryptedResidual = await TestHelpers.createEncryptedDeposit(vaultAddress, signers.deployer, residual);
+      await vault
+        .connect(signers.deployer)
+        .requestUpdateRatio(newRatio, encryptedResidual.handles[0], encryptedResidual.inputProof);
+
+      // Finalize right away so the ratio is updated before the next allocation event.
+      const requestId = await vault.requestCounter();
+      const requestDecryptBool = (await vault.requests(requestId)).isCorrect;
+      const publicDecryptResults = await fhevm.publicDecrypt([requestDecryptBool]);
+      const abiEncodedClearRequestDecryptBool = publicDecryptResults.abiEncodedClearValues;
+      const decryptionProof = publicDecryptResults.decryptionProof;
+
+      await vault
+        .connect(signers.deployer)
+        .finalizeUpdateRatio(requestId, abiEncodedClearRequestDecryptBool, decryptionProof);
+
+      // check the new ratio
+      const newRatioAfterUpdate = await vault.ratio();
+      expect(newRatioAfterUpdate).to.eq(newRatio);
+    });
+
+    it("Increase allocated amount for protocols again", async function () {
+      // Increase the allocated amount once more to simulate an additional yield event.
+      // This will be reflected in the total assets after deallocation and in the ratio update test.
+      const encrypted = await fhevm
+        .createEncryptedInput(await protocol1.getAddress(), signers.deployer.address)
+        .add64(TEST_AMOUNTS.protocolAllocate)
+        .encrypt();
+
+      await protocol1
+        .connect(signers.deployer)
+        .increaseAllocatedAmount(vaultAddress, encrypted.handles[0], encrypted.inputProof);
     });
 
     it("Should deallocate strategy", async function () {
@@ -591,7 +678,7 @@ describe("ConfidentialVault deposit/ratio/withdraw flow", function () {
       await vault.connect(signers.deployer).updateSnapshot();
 
       // get contract total assets after deallocation
-      const totalAssetsAfter = await vault.totalAssets();
+      const totalAssetsAfter = await vault.snapshotTotalAssets();
       const clearTotalAssetsAfter = await fhevm.userDecryptEuint(
         FhevmType.euint64,
         totalAssetsAfter.toString(),
@@ -599,22 +686,55 @@ describe("ConfidentialVault deposit/ratio/withdraw flow", function () {
         signers.deployer,
       );
 
-      expect(clearTotalAssetsAfter).to.eq(
-        TEST_AMOUNTS.aliceDeposit + TEST_AMOUNTS.bobDeposit + TEST_AMOUNTS.protocolAllocate,
+      const totalVaultShares = await vault.totalShares();
+      const clearTotalVaultShares = await fhevm.userDecryptEuint(
+        FhevmType.euint64,
+        totalVaultShares.toString(),
+        vaultAddress,
+        signers.deployer,
       );
+
+      expect(clearTotalAssetsAfter).to.eq(
+        TEST_AMOUNTS.aliceDeposit + TEST_AMOUNTS.bobDeposit + 2n * TEST_AMOUNTS.protocolAllocate,
+      );
+
+      expect(clearTotalVaultShares).to.eq(TEST_AMOUNTS.aliceDeposit + TEST_AMOUNTS.bobDeposit);
     });
 
     it("Test request ratio update after yield", async function () {
-      const totalShares = TEST_AMOUNTS.aliceDeposit + TEST_AMOUNTS.bobDeposit;
-      const totalAssetsAfterYield = totalShares + TEST_AMOUNTS.yieldToVault;
+      // The snapshot was taken after deallocation in the previous test
+      // From the "Should deallocate strategy" test, we know the actual snapshot values:
+      // - snapshotTotalAssets = aliceDeposit + bobDeposit + 2 * protocolAllocate = 4_800_000
+      // - snapshotTotalShares = aliceDeposit + bobDeposit = 1_600_000
+      // These are the values the contract will use for the ratio calculation
+      const snapshotTotalShares = TEST_AMOUNTS.aliceDeposit + TEST_AMOUNTS.bobDeposit;
+      const snapshotTotalAssets =
+        TEST_AMOUNTS.aliceDeposit + TEST_AMOUNTS.bobDeposit + 2n * TEST_AMOUNTS.protocolAllocate;
 
-      const newRatio = (totalShares * BASE_RATE) / totalAssetsAfterYield;
-      const calculatedShares = (totalAssetsAfterYield * newRatio) / BASE_RATE;
+      // Calculate new ratio based on snapshot values
+      // The contract checks: (snapshotTotalAssets * newRatio) / BASE_RATE + residual == snapshotTotalShares
+      // Rearranging: newRatio ≈ (snapshotTotalShares * BASE_RATE) / snapshotTotalAssets
+      // But due to integer division, we need a residual to account for rounding
+      const newRatio = (snapshotTotalShares * BASE_RATE) / snapshotTotalAssets;
+      const calculatedShares = (snapshotTotalAssets * newRatio) / BASE_RATE;
 
-      const residual = totalShares - calculatedShares;
+      // Calculate residual to account for integer division rounding errors
+      // residual = snapshotTotalShares - calculatedShares
+      // This ensures: calculatedShares + residual == snapshotTotalShares exactly
+      const residual = snapshotTotalShares - calculatedShares;
 
+      // Verify the calculation matches exactly (this is what the contract will check)
+      expect(calculatedShares + residual).to.eq(snapshotTotalShares);
+
+      // Verify residual is less than totalAssets (required by first condition in contract)
+      expect(residual).to.be.lt(snapshotTotalAssets);
+
+      // Encrypt the residual value for the contract call
       const encryptedResidual = await TestHelpers.createEncryptedDeposit(vaultAddress, signers.deployer, residual);
 
+      // Request the ratio update - the contract will verify that:
+      // 1. residual < snapshotTotalAssets (firstCondition)
+      // 2. (snapshotTotalAssets * newRatio) / BASE_RATE + residual == snapshotTotalShares (secondCondition)
       const tx = await vault
         .connect(signers.deployer)
         .requestUpdateRatio(newRatio, encryptedResidual.handles[0], encryptedResidual.inputProof);
@@ -668,7 +788,7 @@ describe("ConfidentialVault deposit/ratio/withdraw flow", function () {
       const ratioAfter = await vault.ratio();
 
       // Check underlying increased by withdrawn assets
-      expect(afterBalance - beforeBalance).to.eq((TEST_AMOUNTS.aliceDeposit * ratioBefore) / ratioAfter);
+      expect(afterBalance - beforeBalance).to.eq((TEST_AMOUNTS.aliceDeposit * BASE_RATE) / ratioAfter);
     });
   });
 });

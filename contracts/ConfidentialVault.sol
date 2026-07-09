@@ -6,6 +6,8 @@ import {ERC7984} from "@openzeppelin/confidential-contracts/token/ERC7984/ERC798
 import {ERC7984MintableBurnable} from "./ERC7984MintableBurnable.sol";
 import {Protocol} from "./Protocol.sol";
 
+import "hardhat/console.sol";
+
 /**
  * @title ConfidentialVault
  * @notice Confidential ERC4626 compatible vault with snapshot-based ratio updates.
@@ -39,7 +41,6 @@ contract ConfidentialVault is ERC7984MintableBurnable {
         ebool isValid;
         bool isCompleted;
     }
-
     struct AllocatedAmount {
         address protocol;
         euint64 allocatedAmount;
@@ -229,11 +230,15 @@ contract ConfidentialVault is ERC7984MintableBurnable {
     }
 
     function updateSnapshot() external onlyVaultManager {
-        snapshotTotalAssets = totalAssets();
+        // snapshot total assets = total assets + allocated amount
+        snapshotTotalAssets = FHE.add(totalAssets(), _getAllocatedAmount());
         snapshotTotalShares = totalShares();
 
         FHE.allow(snapshotTotalAssets, vaultManager);
         FHE.allow(snapshotTotalShares, vaultManager);
+
+        FHE.allowThis(snapshotTotalAssets);
+        FHE.allowThis(snapshotTotalShares);
     }
 
     function finalizeUpdateRatio(
@@ -260,8 +265,8 @@ contract ConfidentialVault is ERC7984MintableBurnable {
     ) external virtual {
         euint64 residual = FHE.fromExternal(inputResidual, inputProof);
 
-        euint64 _totalShares = totalShares();
-        euint64 _totalAssets = totalAssets();
+        euint64 _totalShares = snapshotTotalShares;
+        euint64 _totalAssets = snapshotTotalAssets;
 
         euint64 calTotalShares = FHE.div(FHE.mul(_totalAssets, newRatio), BASE_RATE);
         calTotalShares = FHE.add(calTotalShares, residual);
@@ -335,9 +340,6 @@ contract ConfidentialVault is ERC7984MintableBurnable {
         strategyCounter++;
 
         Strategy storage pendingStrategy = pendingStrategies[strategyCounter];
-        euint64 _totalAssets = totalAssets();
-        pendingStrategy.totalAssets = _totalAssets;
-
         pendingStrategy.isValid = isTotalValid;
         pendingStrategy.isCompleted = false;
 
@@ -355,7 +357,10 @@ contract ConfidentialVault is ERC7984MintableBurnable {
         require(isFinalized[currentStrategyId], "Strategy is not finalized");
         require(!strategy.isCompleted, "Strategy is not completed");
         strategy.isCompleted = true;
-        euint64 totalAllocatedAmount = strategy.totalAssets;
+
+        euint64 _totalAssets = totalAssets();
+        euint64 totalAllocatedAmount = _totalAssets;
+        strategy.totalAssets = _totalAssets;
 
         // allocate strategy
         for (uint256 i = 0; i < strategy.positions.length; i++) {
@@ -363,6 +368,7 @@ contract ConfidentialVault is ERC7984MintableBurnable {
 
             // allocate position
             euint64 allocatedAmount = FHE.div(FHE.mul(totalAllocatedAmount, position.weight), ONE_HUNDRED_PERCENT);
+
             FHE.allowTransient(allocatedAmount, position.protocol);
             FHE.allowTransient(allocatedAmount, cAsset);
             // approve protocol to spend the allocated amount
@@ -383,6 +389,10 @@ contract ConfidentialVault is ERC7984MintableBurnable {
     }
 
     function getCurrentAllocatedAmount() external onlyVaultManager {
+        _getAllocatedAmount();
+    }
+
+    function _getAllocatedAmount() internal returns (euint64 totalAllocatedAmount) {
         delete _allocatedStrategyAmounts;
 
         Strategy storage strategy = pendingStrategies[currentStrategyId];
@@ -394,10 +404,14 @@ contract ConfidentialVault is ERC7984MintableBurnable {
 
             FHE.allow(allocatedAmount, vaultManager);
 
+            totalAllocatedAmount = FHE.add(totalAllocatedAmount, allocatedAmount);
+
             _allocatedStrategyAmounts.push(
                 AllocatedAmount({protocol: position.protocol, allocatedAmount: allocatedAmount})
             );
         }
+
+        // FHE.allowThis(totalAllocatedAmount);
     }
 
     function viewCurrentAllocatedAmount() external view returns (AllocatedAmount[] memory) {
