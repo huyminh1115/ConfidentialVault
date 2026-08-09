@@ -74,21 +74,19 @@ const config: HardhatUserConfig = {
     tests: "./test",
   },
   solidity: {
-    version: "0.8.27",
+    version: "0.8.28",
     settings: {
       metadata: {
         // Not including the metadata hash
-        // https://github.com/paulrberg/hardhat-template/issues/31
+        // https://hardhat.org/hardhat-runner/docs/guides/compile-contracts#configuration
         bytecodeHash: "none",
       },
-      // Disable the optimizer when debugging
-      // https://hardhat.org/hardhat-network/#solidity-optimizer-support
       optimizer: {
         enabled: true,
-        runs: 800,
+        runs: 200,
       },
       evmVersion: "cancun",
-      viaIR: false,
+      viaIR: true,
     },
   },
   typechain: {
