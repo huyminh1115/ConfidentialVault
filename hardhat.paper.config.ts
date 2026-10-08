@@ -11,7 +11,8 @@ const config: HardhatUserConfig = {
       optimizer: { enabled: true, runs: 200 },
       viaIR: true,
       evmVersion: "cancun",
-      metadata: { bytecodeHash: "ipfs" },
+      metadata: { bytecodeHash: "ipfs", useLiteralContent: true },
+      outputSelection: { "*": { "*": ["abi", "evm.bytecode", "evm.deployedBytecode", "evm.methodIdentifiers", "metadata", "devdoc", "userdoc", "storageLayout", "evm.gasEstimates"], "": ["ast"] } },
     },
   },
   networks: {
