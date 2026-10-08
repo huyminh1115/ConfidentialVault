@@ -1,5 +1,7 @@
 # FHEVM Hardhat Template
 
+For short paper-reproduction commands, see [PAPER_REPRODUCTION.md](PAPER_REPRODUCTION.md) or run `make help`.
+
 A Hardhat-based template for developing Fully Homomorphic Encryption (FHE) enabled Solidity smart contracts using the
 FHEVM protocol by Zama.
 
